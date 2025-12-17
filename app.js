@@ -1,4 +1,4 @@
-// Theme Toggle
+// Theme Toggle 
 const themeBtn = document.getElementById("themeToggle");
 
 function setTheme(theme) {
@@ -35,7 +35,7 @@ function randn() {
   return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
 }
 
-// Simple toast feedback
+// Simple toast feedback (INFO310: immediate feedback)
 const toastEl = document.getElementById("toast");
 let toastTimer = null;
 function toast(msg) {
@@ -80,7 +80,7 @@ class Stack {
   isEmpty() { return this.arr.length === 0; }
 }
 
-// DS: PriorityQueue (Binary Heap) 
+// DS: PriorityQueue (Binary Heap)
 class PriorityQueue {
   // compare: return <0 if a higher priority than b
   constructor(compareFn) {
@@ -223,7 +223,7 @@ function generateVitals(patient, tMs) {
   return { hr, spo2, temp, inEvent };
 }
 
-// Alerts (rules evaluation)
+// Alerts (rules evaluation) 
 function evaluateRules(rules, sample, patientId) {
   const alerts = [];
 
@@ -257,4 +257,336 @@ function drawLineChart(canvas, series, opts) {
 
   // grid
   ctx.strokeStyle = "rgba(120,120,120,0.25)";
-  ctx.lineWidth =
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 5; i++) {
+    const y = (h * i) / 5;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+
+  // label
+  ctx.fillStyle = "rgba(120,120,120,0.9)";
+  ctx.font = "12px ui-monospace, Menlo, monospace";
+  ctx.fillText(opts.label, 10, 18);
+
+  if (!series || series.length < 2) return;
+
+  const minY = opts.minY, maxY = opts.maxY;
+  const pad = 10;
+  const xStep = (w - pad * 2) / (series.length - 1);
+
+  // line
+  ctx.strokeStyle = "rgba(37,99,235,0.9)";
+  if (document.documentElement.dataset.theme === "dark") {
+    ctx.strokeStyle = "rgba(96,165,250,0.95)";
+  }
+  ctx.lineWidth = 2;
+
+  ctx.beginPath();
+  for (let i = 0; i < series.length; i++) {
+    const x = pad + i * xStep;
+    const yNorm = (series[i] - minY) / (maxY - minY);
+    const y = h - pad - yNorm * (h - pad * 2);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+// App State 
+const patients = new SimpleHashTable();
+patients.set("P1", new PatientState("P1", "Patient A", { hr: 78, spo2: 96, temp: 98.6 }));
+patients.set("P2", new PatientState("P2", "Patient B", { hr: 82, spo2: 97, temp: 98.8 }));
+patients.set("P3", new PatientState("P3", "Patient C", { hr: 72, spo2: 98, temp: 98.4 }));
+
+let selectedPatientId = "P1";
+let rules = loadRules();
+const undo = new Stack();
+
+let timer = null;
+let runLog = [];
+let metrics = { total: 0, tp: 0, fp: 0 };
+
+// alert history + PQ
+let alertHistory = []; // keep last N seconds
+let alertPQ = new PriorityQueue();
+
+// DOM
+const patientSelect = document.getElementById("patientSelect");
+const liveVitals = document.getElementById("liveVitals");
+const alertsEl = document.getElementById("alerts");
+
+const mTotal = document.getElementById("mTotal");
+const mTP = document.getElementById("mTP");
+const mFP = document.getElementById("mFP");
+
+const btnStart = document.getElementById("btnStart");
+const btnStop = document.getElementById("btnStop");
+const btnInject = document.getElementById("btnInject");
+const btnUndo = document.getElementById("btnUndo");
+const btnSaveRules = document.getElementById("btnSaveRules");
+const btnExport = document.getElementById("btnExport");
+
+const canvasHR = document.getElementById("chartHR");
+const canvasSPO2 = document.getElementById("chartSPO2");
+const canvasTEMP = document.getElementById("chartTEMP");
+
+function getPatient() { return patients.get(selectedPatientId); }
+
+// UI Helpers
+function syncRuleInputs() {
+  const map = [
+    ["hrHigh", "hrHigh", "int"],
+    ["hrCritical", "hrCritical", "int"],
+    ["spo2Low", "spo2Low", "int"],
+    ["spo2Critical", "spo2Critical", "int"],
+    ["tempHigh", "tempHigh", "float"],
+    ["tempCritical", "tempCritical", "float"],
+  ];
+  for (const [id, key] of map) {
+    const el = document.getElementById(id);
+    if (el) el.value = rules[key];
+  }
+}
+
+function bindRuleInputs() {
+  const bind = (id, key, type) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+
+    el.addEventListener("change", () => {
+      undo.push({ ...rules }); // stack snapshot
+      rules[key] = type === "float" ? parseFloat(el.value) : parseInt(el.value, 10);
+      toast("Rule updated (Undo available).");
+      renderAll();
+    });
+  };
+
+  bind("hrHigh", "hrHigh", "int");
+  bind("hrCritical", "hrCritical", "int");
+  bind("spo2Low", "spo2Low", "int");
+  bind("spo2Critical", "spo2Critical", "int");
+  bind("tempHigh", "tempHigh", "float");
+  bind("tempCritical", "tempCritical", "float");
+}
+
+function renderVitals() {
+  const p = getPatient();
+  const lastHR = p.hr.last();
+  const lastS = p.spo2.last();
+  const lastT = p.temp.last();
+  const eventActive = nowMs() < p.eventActiveUntil;
+
+  liveVitals.innerHTML = `
+    <div class="item"><div class="label">HR</div><div class="val">${lastHR ? lastHR.toFixed(0) : "—"} bpm</div></div>
+    <div class="item"><div class="label">SpO₂</div><div class="val">${lastS ? lastS.toFixed(0) : "—"} %</div></div>
+    <div class="item"><div class="label">Temp</div><div class="val">${lastT ? lastT.toFixed(1) : "—"} °F</div></div>
+    <div class="item"><div class="label">Event</div><div class="val">${eventActive ? "ACTIVE" : "none"}</div></div>
+  `;
+}
+
+function renderCharts() {
+  const p = getPatient();
+  drawLineChart(canvasHR, p.hr.toArray(), { minY: 40, maxY: 200, label: "Heart Rate (bpm)" });
+  drawLineChart(canvasSPO2, p.spo2.toArray(), { minY: 75, maxY: 100, label: "SpO₂ (%)" });
+  drawLineChart(canvasTEMP, p.temp.toArray(), { minY: 96, maxY: 104, label: "Temp (°F)" });
+}
+
+function rebuildAlertPQ() {
+  alertPQ = new PriorityQueue();
+  for (const a of alertHistory) alertPQ.push(a);
+}
+
+function renderAlerts() {
+  alertsEl.innerHTML = "";
+
+  const top = alertPQ.toSortedArray(12);
+  if (top.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "muted small";
+    empty.textContent = "No alerts yet. Click Start, or Inject Event, or lower thresholds.";
+    alertsEl.appendChild(empty);
+    return;
+  }
+
+  for (const a of top) {
+    const div = document.createElement("div");
+    div.className = "alert";
+    const badgeClass = a.priority === 1 ? "critical" : "warn";
+    const badgeLabel = a.priority === 1 ? "CRITICAL" : "WARN";
+
+    div.innerHTML = `
+      <div class="top">
+        <div>${a.patientId} • ${a.type}</div>
+        <div class="badge ${badgeClass}">${badgeLabel}</div>
+      </div>
+      <div class="msg">${a.msg}</div>
+      <div class="meta">time ${fmtTime(a.ts)} • ${a.inEvent ? "true event" : "no event"}</div>
+    `;
+    alertsEl.appendChild(div);
+  }
+}
+
+function renderMetrics() {
+  mTotal.textContent = String(metrics.total);
+  mTP.textContent = String(metrics.tp);
+  mFP.textContent = String(metrics.fp);
+}
+
+function renderAll() {
+  renderVitals();
+  renderCharts();
+  renderAlerts();
+  renderMetrics();
+}
+
+// Controls
+function start() {
+  if (timer) return;
+  timer = setInterval(tick, 1000);
+  toast("Streaming started.");
+  tick();
+}
+function stop() {
+  if (!timer) return;
+  clearInterval(timer);
+  timer = null;
+  toast("Streaming stopped.");
+}
+
+function injectEvent() {
+  const p = getPatient();
+  p.eventActiveUntil = nowMs() + 25_000;
+  toast(`Injected event for ${p.label} (25s).`);
+  renderAll();
+}
+
+function undoRules() {
+  const prev = undo.pop();
+  if (!prev) { toast("Nothing to undo."); return; }
+  rules = prev;
+  syncRuleInputs();
+  toast("Undo applied.");
+  renderAll();
+}
+
+function saveRules() {
+  saveRulesToStorage(rules);
+  toast("Rules saved.");
+}
+
+function exportCSV() {
+  if (runLog.length === 0) {
+    toast("Nothing to export yet. Click Start first.");
+    return;
+  }
+  const header = ["ts","time","patientId","hr","spo2","temp","inEvent","alertCount"].join(",");
+  const rows = runLog.map(r => [
+    r.ts,
+    `"${fmtTime(r.ts)}"`,
+    r.patientId,
+    r.hr.toFixed(2),
+    r.spo2.toFixed(2),
+    r.temp.toFixed(2),
+    r.inEvent ? 1 : 0,
+    r.alertCount
+  ].join(","));
+  const csv = [header, ...rows].join("\n");
+
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `vitalstream_run_${Date.now()}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  toast("CSV exported.");
+}
+
+// Main Tick
+function tick() {
+  const t = nowMs();
+
+  // keep last 2 minutes of alerts
+  const ALERT_WINDOW_MS = 2 * 60 * 1000;
+
+  for (const id of patients.keys()) {
+    const p = patients.get(id);
+    const s = generateVitals(p, t);
+
+    p.hr.push(s.hr);
+    p.spo2.push(s.spo2);
+    p.temp.push(s.temp);
+
+    const found = evaluateRules(rules, s, id);
+    for (const a of found) {
+      const alert = {
+        ...a,
+        ts: t,
+        id: `${t}-${Math.random().toString(16).slice(2)}`,
+        inEvent: s.inEvent
+      };
+      alertHistory.push(alert);
+
+      metrics.total += 1;
+      if (s.inEvent) metrics.tp += 1;
+      else metrics.fp += 1;
+    }
+
+    runLog.push({
+      ts: t,
+      patientId: id,
+      hr: s.hr,
+      spo2: s.spo2,
+      temp: s.temp,
+      inEvent: s.inEvent,
+      alertCount: found.length
+    });
+  }
+
+  // trim alert history + rebuild PQ
+  alertHistory = alertHistory.filter(a => (t - a.ts) <= ALERT_WINDOW_MS);
+  rebuildAlertPQ();
+
+  // trim run log to last ~20 minutes to avoid huge memory
+  const RUN_WINDOW = 20 * 60;
+  if (runLog.length > RUN_WINDOW * 3) runLog = runLog.slice(-RUN_WINDOW * 3);
+
+  renderAll();
+}
+
+// Mount
+function mount() {
+  // patient select from hash table
+  patientSelect.innerHTML = "";
+  for (const id of patients.keys()) {
+    const p = patients.get(id);
+    const opt = document.createElement("option");
+    opt.value = id;
+    opt.textContent = `${p.label} (${id})`;
+    patientSelect.appendChild(opt);
+  }
+  patientSelect.value = selectedPatientId;
+  patientSelect.addEventListener("change", () => {
+    selectedPatientId = patientSelect.value;
+    toast(`Viewing ${patients.get(selectedPatientId).label}.`);
+    renderAll();
+  });
+
+  bindRuleInputs();
+  syncRuleInputs();
+
+  btnStart.addEventListener("click", start);
+  btnStop.addEventListener("click", stop);
+  btnInject.addEventListener("click", injectEvent);
+
+  btnUndo.addEventListener("click", undoRules);
+  btnSaveRules.addEventListener("click", saveRules);
+  btnExport.addEventListener("click", exportCSV);
+
+  // initial render
+  renderAll();
+}
+
+window.addEventListener("DOMContentLoaded", mount);
